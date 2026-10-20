@@ -1,4 +1,4 @@
-"""Telegram -> private GitHub release -> isolated macOS Actions -> Telegram.
+"""Telegram local Bot API -> temporary private GitHub release -> macOS Actions -> Telegram.
 
 This bot never executes user source code in its own process/container.
 """
@@ -26,9 +26,9 @@ GH_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GH_REPO = os.environ.get("GITHUB_REPO", "").strip()
 GH_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 ALLOWED = {int(v.strip()) for v in os.environ.get("ALLOWED_USER_IDS", "").split(",") if v.strip().isdigit()}
-MAX_UPLOAD = 18 * 1024 * 1024  # Standard Telegram getFile limit is 20 MB.
+MAX_UPLOAD = 100 * 1024 * 1024  # Local Telegram Bot API; also subject to GitHub upload limits.
 MAX_RELEASE_UPLOAD = 100 * 1024 * 1024  # Larger source ZIP via private GitHub Release.
-MAX_OUTPUT = 49 * 1024 * 1024
+MAX_OUTPUT = 180 * 1024 * 1024  # Local Bot API supports sending larger generated files.
 WAIT_SECONDS = 25 * 60
 GITHUB_API = "https://api.github.com"
 
@@ -126,7 +126,7 @@ class Github:
                 for part in response.iter_content(1024 * 1024):
                     if part:
                         length += len(part)
-                        if length > 65 * 1024 * 1024:
+                        if length > 220 * 1024 * 1024:
                             raise RuntimeError("Artefato maior que o limite do bot.")
                         fp.write(part)
 
@@ -167,10 +167,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized(update):
         return
     await update.message.reply_text(
-        "Compilador iOS online! Envie o source em .zip (ate 18 MB).\n\n"
+        "Compilador iOS online! Envie o source em .zip (ate 100 MB).\n\n"
         "Escolha /modo auto, /modo dylib ou /modo ipa.\n"
         "auto detecta projetos Theos (Makefile) ou Xcode (.xcodeproj/.xcworkspace).\n"
-        "Para ZIP maior (ate 100 MB): anexe source.zip a uma Release privada do GitHub, depois /release TAG.\n"
+        "Envio direto: o bot cria e apaga a Release temporaria automaticamente.\n"
         "Use /status para consultar a compilacao.\n\n"
         "OBS: .ipa gerado sem assinatura; assinatura/instalacao sao etapas separadas."
     )
@@ -222,11 +222,14 @@ async def compile_from_release(update: Update, github: Github, *, tag: str, mode
             await asyncio.to_thread(github.download_artifact, artifact_id, artifact)
             output = choose_output(artifact, folder)
             if output.stat().st_size > MAX_OUTPUT:
-                await status.edit_text(f"Compilado, mas o arquivo excede 49 MB no Telegram. Baixe no GitHub:\n{url}")
+                await status.edit_text(f"Compilado, mas o arquivo excede {MAX_OUTPUT // (1024 * 1024)} MB. Baixe no GitHub:\n{url}")
                 return
-            with output.open("rb") as fp:
-                await update.message.reply_document(document=fp, filename=output.name,
-                                                    caption=f"Compilacao concluida! ID: {job_id}")
+            # Local Bot API accepts a path directly and does not reupload big files from the bot process.
+            await update.message.reply_document(
+                document=output, filename=output.name,
+                caption=f"Compilacao concluida! ID: {job_id}",
+                read_timeout=180, write_timeout=180,
+            )
             await status.edit_text(f"Compilacao concluida! ID: {job_id}")
             return
         await status.edit_text(f"Tempo maximo de espera atingido. Confira as Actions:\nhttps://github.com/{GH_REPO}/actions")
@@ -283,8 +286,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not doc.file_size or doc.file_size > MAX_UPLOAD:
         await update.message.reply_text(
-            "O envio direto tem limite de 18 MB. Para um ZIP maior, anexe source.zip "
-            "a uma Release privada no GitHub e envie /release NOME_DA_TAG (ate 100 MB)."
+            "O arquivo excede o limite configurado de 100 MB por ZIP. "
+            "Envie um projeto menor ou ajuste a infraestrutura para volumes maiores."
         )
         return
     uid = update.effective_user.id
@@ -302,7 +305,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             source = folder / "source.zip"
             status = await update.message.reply_text(f"Recebido! Job {job_id}: enviando source para compilacao...")
             tg_file = await doc.get_file()
-            await tg_file.download_to_drive(custom_path=str(source))
+            # In local mode, getFile resolves to a path on the SAME container's disk.
+            # PTB copies it to our temporary path when custom_path is provided.
+            await tg_file.download_to_drive(custom_path=source)
+            if not source.is_file():
+                raise RuntimeError("A API local nao disponibilizou o ZIP; verifique o armazenamento.")
+            if source.stat().st_size > MAX_UPLOAD:
+                raise ValueError("ZIP excede 100 MB.")
             if not zipfile.is_zipfile(source):
                 raise ValueError("ZIP invalido ou corrompido.")
             # Check metadata before shipping. Unpacking occurs only in an isolated Actions runner.
@@ -329,7 +338,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     validate_config()
-    application = Application.builder().token(TOKEN).concurrent_updates(4).build()
+    local_api = os.environ.get("TELEGRAM_LOCAL_API_URL", "http://127.0.0.1:8081").rstrip("/")
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .base_url(f"{local_api}/bot")
+        .base_file_url(f"{local_api}/file/bot")
+        .local_mode(True)
+        .concurrent_updates(4)
+        .build()
+    )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
     application.add_handler(CommandHandler("modo", mode_cmd))
