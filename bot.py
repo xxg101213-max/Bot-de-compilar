@@ -26,7 +26,8 @@ GH_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GH_REPO = os.environ.get("GITHUB_REPO", "").strip()
 GH_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 ALLOWED = {int(v.strip()) for v in os.environ.get("ALLOWED_USER_IDS", "").split(",") if v.strip().isdigit()}
-MAX_UPLOAD = 18 * 1024 * 1024  # Keep below common Telegram Bot API getFile limit.
+MAX_UPLOAD = 18 * 1024 * 1024  # Standard Telegram getFile limit is 20 MB.
+MAX_RELEASE_UPLOAD = 100 * 1024 * 1024  # Larger source ZIP via private GitHub Release.
 MAX_OUTPUT = 49 * 1024 * 1024
 WAIT_SECONDS = 25 * 60
 GITHUB_API = "https://api.github.com"
@@ -57,6 +58,18 @@ class Github:
             message = r.text[:350].replace(GH_TOKEN, "[token]")
             raise RuntimeError(f"GitHub {method} {path}: HTTP {r.status_code}: {message}")
         return r.json() if r.content else None
+
+    def check_uploaded_release(self, tag: str) -> None:
+        """Allow only a source.zip uploaded by the repo owner via a published release."""
+        release = self.request("GET", f"/releases/tags/{tag}")
+        if release.get("draft"):
+            raise ValueError("Publique a Release no GitHub antes de usar /release.")
+        assets = [a for a in release.get("assets", []) if a.get("name") == "source.zip"]
+        if len(assets) != 1:
+            raise ValueError("A Release precisa conter exatamente um anexo chamado source.zip.")
+        size = int(assets[0].get("size") or 0)
+        if not 0 < size <= MAX_RELEASE_UPLOAD:
+            raise ValueError("O source.zip da Release precisa ter entre 1 byte e 100 MB.")
 
     def upload_source(self, zip_path: Path, tag: str) -> int:
         release = self.request("POST", "/releases", json={
@@ -154,9 +167,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized(update):
         return
     await update.message.reply_text(
-        "Compilador iOS online! Envie o source em .zip.\n\n"
+        "Compilador iOS online! Envie o source em .zip (ate 18 MB).\n\n"
         "Escolha /modo auto, /modo dylib ou /modo ipa.\n"
         "auto detecta projetos Theos (Makefile) ou Xcode (.xcodeproj/.xcworkspace).\n"
+        "Para ZIP maior (ate 100 MB): anexe source.zip a uma Release privada do GitHub, depois /release TAG.\n"
         "Use /status para consultar a compilacao.\n\n"
         "OBS: .ipa gerado sem assinatura; assinatura/instalacao sao etapas separadas."
     )
@@ -181,6 +195,85 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Em andamento: {job}" if job else "Nenhuma compilacao em andamento.")
 
 
+async def compile_from_release(update: Update, github: Github, *, tag: str, mode: str,
+                               job_id: str, status) -> None:
+    """Run the existing isolated workflow and return output in the Telegram chat."""
+    with tempfile.TemporaryDirectory(prefix="tg_result_") as temp:
+        folder = Path(temp)
+        await asyncio.to_thread(github.dispatch, tag, mode, job_id)
+        await status.edit_text(f"Compilando (modo {mode})... ID: {job_id}")
+        run = None
+        start_at = time.monotonic()
+        while time.monotonic() - start_at < WAIT_SECONDS:
+            await asyncio.sleep(12)
+            if run is None:
+                run = await asyncio.to_thread(github.find_run, job_id)
+                if run is None:
+                    continue
+            state = await asyncio.to_thread(github.get_run, int(run["id"]))
+            if state.get("status") != "completed":
+                continue
+            url = state.get("html_url", f"https://github.com/{GH_REPO}/actions")
+            if state.get("conclusion") != "success":
+                await status.edit_text(f"Falha na compilacao. Consulte o log:\n{url}")
+                return
+            artifact_id = await asyncio.to_thread(github.get_artifact_id, int(run["id"]), job_id)
+            artifact = folder / "compilado.zip"
+            await asyncio.to_thread(github.download_artifact, artifact_id, artifact)
+            output = choose_output(artifact, folder)
+            if output.stat().st_size > MAX_OUTPUT:
+                await status.edit_text(f"Compilado, mas o arquivo excede 49 MB no Telegram. Baixe no GitHub:\n{url}")
+                return
+            with output.open("rb") as fp:
+                await update.message.reply_document(document=fp, filename=output.name,
+                                                    caption=f"Compilacao concluida! ID: {job_id}")
+            await status.edit_text(f"Compilacao concluida! ID: {job_id}")
+            return
+        await status.edit_text(f"Tempo maximo de espera atingido. Confira as Actions:\nhttps://github.com/{GH_REPO}/actions")
+
+
+def reserve_job(context: ContextTypes.DEFAULT_TYPE, uid: int) -> str | None:
+    active = context.application.bot_data.setdefault("active", {})
+    if uid in active:
+        return None
+    job_id = uuid4().hex[:14]
+    active[uid] = job_id
+    return job_id
+
+
+async def release_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Compile a privately uploaded large source ZIP without passing via Telegram getFile."""
+    if not await authorized(update):
+        return
+    tag = context.args[0] if len(context.args) == 1 else ""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", tag):
+        await update.message.reply_text(
+            "Use /release NOME_DA_TAG. A Release precisa ter um anexo chamado source.zip "
+            "(ate 100 MB) no mesmo repositorio privado do bot."
+        )
+        return
+    uid = update.effective_user.id
+    job_id = reserve_job(context, uid)
+    if job_id is None:
+        await update.message.reply_text("Voce ja tem uma compilacao em andamento. Use /status.")
+        return
+    github = Github()
+    status = await update.message.reply_text("Verificando source.zip na Release privada do GitHub...")
+    try:
+        await asyncio.to_thread(github.check_uploaded_release, tag)
+        mode = context.user_data.get("mode", "auto")
+        await compile_from_release(update, github, tag=tag, mode=mode, job_id=job_id, status=status)
+    except (RuntimeError, ValueError, requests.RequestException) as exc:
+        log.exception("Job via Release %s falhou", job_id)
+        await status.edit_text(f"Erro: {str(exc)[:700]}")
+    except Exception:
+        log.exception("Erro inesperado no job via Release %s", job_id)
+        await status.edit_text("Erro inesperado. Confira os logs do bot no Railway.")
+    finally:
+        context.application.bot_data["active"].pop(uid, None)
+    # Intentionally keep user-managed releases. Owner deletes them manually when done.
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized(update):
         return
@@ -189,20 +282,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Envie o projeto compactado no formato .zip.")
         return
     if not doc.file_size or doc.file_size > MAX_UPLOAD:
-        await update.message.reply_text("Arquivo muito grande. Limite desta versao: 18 MB de ZIP.")
+        await update.message.reply_text(
+            "O envio direto tem limite de 18 MB. Para um ZIP maior, anexe source.zip "
+            "a uma Release privada no GitHub e envie /release NOME_DA_TAG (ate 100 MB)."
+        )
         return
-    active = context.application.bot_data.setdefault("active", {})
     uid = update.effective_user.id
-    if uid in active:
+    job_id = reserve_job(context, uid)
+    if job_id is None:
         await update.message.reply_text("Voce ja tem uma compilacao em andamento. Use /status.")
         return
-    job_id = uuid4().hex[:14]
-    active[uid] = job_id
     mode = context.user_data.get("mode", "auto")
     tag = f"compiler-src-{job_id}"
     release_id = None
     github = Github()
-    run = None
     try:
         with tempfile.TemporaryDirectory(prefix="tg_compile_") as temp:
             folder = Path(temp)
@@ -218,35 +311,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if len(files) > 2000 or sum(f.file_size for f in files) > 400 * 1024 * 1024:
                     raise ValueError("ZIP excede o limite de 2000 arquivos ou 400 MB descompactados.")
             release_id = await asyncio.to_thread(github.upload_source, source, tag)
-            await asyncio.to_thread(github.dispatch, tag, mode, job_id)
-            await status.edit_text(f"Compilando (modo {mode})... ID: {job_id}")
-            start_at = time.monotonic()
-            while time.monotonic() - start_at < WAIT_SECONDS:
-                await asyncio.sleep(12)
-                if run is None:
-                    run = await asyncio.to_thread(github.find_run, job_id)
-                    if run is None:
-                        continue
-                state = await asyncio.to_thread(github.get_run, int(run["id"]))
-                if state.get("status") != "completed":
-                    continue
-                url = state.get("html_url", f"https://github.com/{GH_REPO}/actions")
-                if state.get("conclusion") != "success":
-                    await status.edit_text(f"Falha na compilacao. Consulte o log:\n{url}")
-                    return
-                artifact_id = await asyncio.to_thread(github.get_artifact_id, int(run["id"]), job_id)
-                artifact = folder / "compilado.zip"
-                await asyncio.to_thread(github.download_artifact, artifact_id, artifact)
-                output = choose_output(artifact, folder)
-                if output.stat().st_size > MAX_OUTPUT:
-                    await status.edit_text(f"Compilado, mas o arquivo excede 49 MB no Telegram. Baixe no GitHub:\n{url}")
-                    return
-                with output.open("rb") as fp:
-                    await update.message.reply_document(document=fp, filename=output.name,
-                                                        caption=f"Compilacao concluida! ID: {job_id}")
-                await status.edit_text(f"Compilacao concluida! ID: {job_id}")
-                return
-            await status.edit_text(f"Tempo maximo de espera atingido. Confira as Actions:\nhttps://github.com/{GH_REPO}/actions")
+            await compile_from_release(update, github, tag=tag, mode=mode, job_id=job_id, status=status)
     except (RuntimeError, ValueError, zipfile.BadZipFile, requests.RequestException) as exc:
         log.exception("Job %s falhou", job_id)
         await update.message.reply_text(f"Erro: {str(exc)[:700]}")
@@ -254,7 +319,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("Erro inesperado no job %s", job_id)
         await update.message.reply_text("Erro inesperado. Confira os logs do bot no Railway.")
     finally:
-        active.pop(uid, None)
+        context.application.bot_data["active"].pop(uid, None)
         if release_id is not None:
             try:
                 await asyncio.to_thread(github.delete_release, release_id, tag)
@@ -269,6 +334,7 @@ def main():
     application.add_handler(CommandHandler("help", start))
     application.add_handler(CommandHandler("modo", mode_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
+    application.add_handler(CommandHandler("release", release_cmd))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.run_polling(drop_pending_updates=True)
 
