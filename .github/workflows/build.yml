@@ -1,1 +1,69 @@
+name: Compilar source do Telegram
+run-name: compiler-${{ inputs.job_id }}
 
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag da release temporaria privada contendo source.zip'
+        type: string
+        required: true
+      mode:
+        description: 'auto, dylib ou ipa'
+        type: choice
+        options:
+          - auto
+          - dylib
+          - ipa
+        required: true
+      job_id:
+        description: 'Identificador unico da tarefa do Telegram'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compile-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  compile:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Checkout da versao confiavel do compilador
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Baixar source ZIP temporario do GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.release_tag }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/compiler-input"
+          gh release download "$SOURCE_TAG" --repo "$GITHUB_REPOSITORY" --pattern 'source.zip' --dir "$RUNNER_TEMP/compiler-input"
+          test -f "$RUNNER_TEMP/compiler-input/source.zip"
+
+      - name: Preparar Theos para builds de dylib
+        if: inputs.mode != 'ipa'
+        run: |
+          brew install ldid
+          git clone --depth 1 --recursive https://github.com/theos/theos.git "$HOME/theos"
+          git clone --depth 1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
+
+      - name: Compilar em ambiente isolado
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          python3 scripts/build_project.py --zip "$RUNNER_TEMP/compiler-input/source.zip" --mode "$MODE" --out "$RUNNER_TEMP/resultado"
+
+      - name: Armazenar resultado no GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-${{ inputs.job_id }}
+          path: ${{ runner.temp }}/resultado/*
+          if-no-files-found: error
+          retention-days: 2
