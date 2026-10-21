@@ -1,11 +1,12 @@
-"""Start TDLib Bot API and the Telegram compiler in one Railway container.
+"""Start the Telegram Local Bot API and the compiler bot on one Railway service.
 
-This is required for local-mode getFile paths to be visible to the bot.
+Provides actionable, sanitized diagnostics when the local API does not become ready.
 """
 from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -17,50 +18,94 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 API_ID = os.getenv("TELEGRAM_API_ID", "").strip()
 API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 PORT = 8081
+LOCAL_URL = f"http://127.0.0.1:{PORT}"
+
+
+def safe(message: str) -> str:
+    """Keep credentials out of exceptions and Telegram error descriptions."""
+    for secret in (TOKEN, API_HASH):
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
+    return message[:350]
+
+
+def validate_environment() -> None:
+    missing = [name for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_API_ID", "TELEGRAM_API_HASH")
+               if not os.getenv(name, "").strip()]
+    if missing:
+        raise RuntimeError("Variaveis ausentes: " + ", ".join(missing))
+    if not API_ID.isdecimal():
+        raise RuntimeError("TELEGRAM_API_ID deve conter apenas numeros.")
+    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", TOKEN):
+        raise RuntimeError("TELEGRAM_BOT_TOKEN tem formato invalido; confira no BotFather.")
+    configured = os.getenv("TELEGRAM_LOCAL_API_URL", LOCAL_URL).rstrip("/")
+    if configured != LOCAL_URL:
+        raise RuntimeError(f"TELEGRAM_LOCAL_API_URL deve ser {LOCAL_URL}.")
 
 
 def migrate_cloud_once() -> None:
-    """Opt-in one-time logout from cloud Telegram API before using local mode."""
-    if os.getenv("TELEGRAM_CLOUD_LOGOUT", "0") != "1":
+    if os.getenv("TELEGRAM_CLOUD_LOGOUT", "0").strip() != "1":
+        print("TELEGRAM_CLOUD_LOGOUT=0: nao executar logout da API em nuvem.", flush=True)
         return
-    print("Migrando bot da API cloud para a API local (logOut)...", flush=True)
-    response = requests.post(f"https://api.telegram.org/bot{TOKEN}/logOut", timeout=30)
+    print("Executando logOut uma vez para migrar o bot da API Telegram em nuvem...", flush=True)
     try:
+        response = requests.post(f"https://api.telegram.org/bot{TOKEN}/logOut", timeout=30)
         payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError(f"Falha na resposta do logOut: HTTP {response.status_code}") from exc
-    if not payload.get("ok") or payload.get("result") is not True:
-        # Do not expose token or other Telegram-provided fields in logs.
-        raise RuntimeError(f"Nao foi possivel fazer logOut da API cloud (HTTP {response.status_code}).")
-    print("logOut realizado. A API cloud fica indisponivel por ate 10 minutos.", flush=True)
+    except (requests.RequestException, ValueError) as exc:
+        raise RuntimeError("Falha de rede ao solicitar logOut na API em nuvem: " + safe(str(exc))) from None
+    if not response.ok or payload.get("ok") is not True or payload.get("result") is not True:
+        description = safe(str(payload.get("description", "sem detalhes")))
+        raise RuntimeError(f"logOut nao confirmado (HTTP {response.status_code}): {description}")
+    print("logOut confirmado. Depois da primeira inicializacao, volte TELEGRAM_CLOUD_LOGOUT para 0.", flush=True)
 
 
-def wait_for_local_api(process: subprocess.Popen, timeout: float = 120) -> None:
-    url = f"http://127.0.0.1:{PORT}/bot{TOKEN}/getMe"
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(f"Servidor Bot API local terminou com codigo {process.returncode}.")
+def check_local_api_once() -> tuple[bool, str]:
+    """Check local API; return detailed sanitized failure (not just a silent timeout)."""
+    try:
+        r = requests.get(f"{LOCAL_URL}/bot{TOKEN}/getMe", timeout=(3, 12))
         try:
-            response = requests.get(url, timeout=3)
-            if response.ok and response.json().get("ok"):
-                return
-        except (requests.RequestException, ValueError):
-            pass
-        time.sleep(2)
-    raise RuntimeError("Servidor Bot API local nao respondeu em 120 segundos.")
+            payload = r.json()
+        except ValueError:
+            return False, f"HTTP {r.status_code}, resposta nao-JSON: {safe(r.text)}"
+        if r.ok and payload.get("ok") and payload.get("result", {}).get("is_bot"):
+            return True, "getMe respondeu com sucesso"
+        description = safe(str(payload.get("description", "resposta sem detalhes")))
+        return False, f"HTTP {r.status_code}; erro={payload.get('error_code', 'sem codigo')}; {description}"
+    except requests.exceptions.ConnectionError:
+        return False, "Conexao recusada ao acessar 127.0.0.1:8081 (servidor nao abriu a porta)."
+    except requests.exceptions.Timeout:
+        return False, "getMe na API local demorou mais de 12 segundos (possivel rede/TDLib bloqueada)."
+    except requests.RequestException as exc:
+        return False, safe(type(exc).__name__ + ": " + str(exc))
+
+
+def wait_for_local_api(server: subprocess.Popen, timeout_seconds: float = 150.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_failure = "Ainda nao testado"
+    attempt = 0
+    while time.monotonic() < deadline:
+        if server.poll() is not None:
+            raise RuntimeError(f"telegram-bot-api terminou antes de ficar pronto (exit={server.returncode}).")
+        attempt += 1
+        ready, detail = check_local_api_once()
+        if ready:
+            print("API local pronta. Iniciando bot Python.", flush=True)
+            return
+        last_failure = detail
+        # Keep logs informative but avoid needless flooding or secret leakage.
+        if attempt <= 3 or attempt % 3 == 0:
+            print(f"Tentativa {attempt}: API local ainda nao pronta: {detail}", flush=True)
+        time.sleep(3)
+    raise RuntimeError("Servidor local nao respondeu a getMe no prazo. Ultimo diagnostico: " + last_failure)
 
 
 def run() -> None:
-    if not TOKEN or not API_ID.isdecimal() or not API_HASH:
-        raise RuntimeError("Configure TELEGRAM_BOT_TOKEN, TELEGRAM_API_ID e TELEGRAM_API_HASH na Railway.")
-    if os.getenv("TELEGRAM_LOCAL_API_URL", "http://127.0.0.1:8081").rstrip("/") != f"http://127.0.0.1:{PORT}":
-        raise RuntimeError("TELEGRAM_LOCAL_API_URL deve apontar para http://127.0.0.1:8081 neste container.")
-
+    validate_environment()
     for folder in (Path("/app/telegram-data"), Path("/app/telegram-temp")):
         folder.mkdir(parents=True, exist_ok=True)
-
+    print("Iniciando bot Telegram com servidor API local (sem divulgar credenciais).", flush=True)
     migrate_cloud_once()
+
     server = subprocess.Popen([
         "telegram-bot-api",
         "--api-id", API_ID,
@@ -71,14 +116,14 @@ def run() -> None:
         "--dir", "/app/telegram-data",
         "--temp-dir", "/app/telegram-temp",
     ])
-    bot = None
+    bot: subprocess.Popen | None = None
     stopping = False
 
     def stop(signum: int, _frame) -> None:
         nonlocal stopping
         stopping = True
-        print(f"Encerrando (sinal {signum})...", flush=True)
-        if bot and bot.poll() is None:
+        print(f"Recebido sinal {signum}; encerrando com seguranca.", flush=True)
+        if bot is not None and bot.poll() is None:
             bot.terminate()
         if server.poll() is None:
             server.terminate()
@@ -89,28 +134,27 @@ def run() -> None:
         wait_for_local_api(server)
         if stopping:
             return
-        print("API local pronta. Iniciando bot Python.", flush=True)
         bot = subprocess.Popen([sys.executable, "-u", "bot.py"])
         while not stopping:
             if bot.poll() is not None:
-                raise RuntimeError(f"Bot Python terminou (codigo {bot.returncode}).")
+                raise RuntimeError(f"bot.py terminou (exit={bot.returncode}). Consulte traceback acima.")
             if server.poll() is not None:
-                raise RuntimeError(f"Servidor local terminou (codigo {server.returncode}).")
+                raise RuntimeError(f"telegram-bot-api terminou (exit={server.returncode}).")
             time.sleep(1)
     finally:
-        for process in (bot, server):
-            if process is not None and process.poll() is None:
-                process.terminate()
+        for child in (bot, server):
+            if child is not None and child.poll() is None:
+                child.terminate()
                 try:
-                    process.wait(timeout=8)
+                    child.wait(timeout=8)
                 except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                    child.kill()
+                    child.wait()
 
 
 if __name__ == "__main__":
     try:
         run()
     except Exception as exc:
-        print(f"Erro ao iniciar: {exc}", file=sys.stderr, flush=True)
+        print("Erro ao iniciar: " + safe(str(exc)), file=sys.stderr, flush=True)
         sys.exit(1)
